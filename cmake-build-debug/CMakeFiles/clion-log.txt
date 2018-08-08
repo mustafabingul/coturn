@@ -1,0 +1,18 @@
+"D:\Program Files\JetBrains\CLion 2018.1.6\bin\cmake\bin\cmake.exe" -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_C_COMPILER=D:/Program Files/mingw-w64/x86_64-8.1.0-posix-seh-rt_v6-rev0/mingw64/bin/gcc.exe" -G "CodeBlocks - MinGW Makefiles" D:\turnserver\coturn
+CMake Error at D:/Program Files/JetBrains/CLion 2018.1.6/bin/cmake/share/cmake-3.10/Modules/CMakeMinGWFindMake.cmake:12 (message):
+  sh.exe was found in your PATH, here:
+
+  D:/cygwin64/bin/sh.exe
+
+  For MinGW make to work correctly sh.exe must NOT be in your path.
+
+  Run cmake from a shell that does not have sh.exe in your PATH.
+
+  If you want to use a UNIX shell, then use MSYS Makefiles.
+
+Call Stack (most recent call first):
+  CMakeLists.txt:2 (project)
+
+
+CMake Error: CMAKE_CXX_COMPILER not set, after EnableLanguage
+-- Configuring incomplete, errors occurred!

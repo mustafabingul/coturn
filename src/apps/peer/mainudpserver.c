@@ -65,6 +65,8 @@ int main(int argc, char **argv)
 	set_logfile("stdout");
 	set_system_parameters(0);
 
+
+
 	while ((c = getopt(argc, argv, "d:p:L:v")) != -1)
 		switch (c){
 		case 'd':

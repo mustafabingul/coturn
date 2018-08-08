@@ -261,7 +261,6 @@ int send_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int data_con
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,"Socket write error 111.666: \n");
 					if (handle_socket_error())
 						break;
-					/* Falls through. */
 				case SSL_ERROR_SSL:
 				{
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL write error: \n");
@@ -271,7 +270,6 @@ int send_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int data_con
 						ERR_error_string(ERR_get_error(),buf),
 						SSL_get_error(ssl, len));
 				}
-				/* Falls through. */
 				default:
 					clnet_info->broken = 1;
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,"Unexpected error while writing!\n");
@@ -459,7 +457,6 @@ int recv_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int sync, in
 							"Socket read error 111.999: \n");
 					if (handle_socket_error())
 						break;
-					/* Falls through. */
 				case SSL_ERROR_SSL: {
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL write error: \n");
 					char buf[1024];
@@ -467,7 +464,6 @@ int recv_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int sync, in
 							ERR_error_string(ERR_get_error(), buf),
 							SSL_get_error(ssl, rc));
 				}
-				/* Falls through. */
 				default:
 					clnet_info->broken = 1;
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,
@@ -529,7 +525,6 @@ int recv_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int sync, in
 							"Socket read error 111.999: \n");
 					if (handle_socket_error())
 						break;
-					/* Falls through. */
 				case SSL_ERROR_SSL: {
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "SSL write error: \n");
 					char buf[1024];
@@ -537,7 +532,6 @@ int recv_buffer(app_ur_conn_info *clnet_info, stun_buffer* message, int sync, in
 							ERR_error_string(ERR_get_error(), buf),
 							SSL_get_error(ssl, rc));
 				}
-				/* Falls through. */
 				default:
 					clnet_info->broken = 1;
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO,

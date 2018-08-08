@@ -104,8 +104,6 @@ DH_1066, "", "", "",
 0,
 #endif
 
-NULL, PTHREAD_MUTEX_INITIALIZER,
-
 TURN_VERBOSE_NONE,0,0,0,
 "/var/run/turnserver.pid",
 DEFAULT_STUN_PORT,DEFAULT_STUN_TLS_PORT,0,0,1,
@@ -116,7 +114,7 @@ DEFAULT_STUN_PORT,DEFAULT_STUN_TLS_PORT,0,0,1,
   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,0,0,NULL,NULL,NULL
 },
 {NULL, 0},{NULL, 0},
-NEV_UNKNOWN, 
+NEV_UNKNOWN,
 { "Unknown", "UDP listening socket per session", "UDP thread per network endpoint", "UDP thread per CPU core" },
 //////////////// Relay servers //////////////////////////////////
 LOW_DEFAULT_PORTS_BOUNDARY,HIGH_DEFAULT_PORTS_BOUNDARY,0,0,0,"",
@@ -177,7 +175,6 @@ static char procgroupname[1025]="\0";
 ////////////// Configuration functionality ////////////////////////////////
 
 static void read_config_file(int argc, char **argv, int pass);
-static void reload_ssl_certs(evutil_socket_t sock, short events, void *args);
 
 //////////////////////////////////////////////////
 
@@ -650,6 +647,8 @@ static char AdminUsage[] = "Usage: turnadmin [command] [options]\n"
 	"	-I, --list-origins		List origin-to-realm relations.\n"
 	"	-g, --set-realm-option		Set realm params: max-bps, total-quota, user-quota.\n"
 	"	-G, --list-realm-options	List realm params.\n"
+	"	-E, --generate-encrypted-password-aes	Generate and print to the standard\n"
+	"					output an encrypted form of password with AES-128\n"
 	"\nOptions with mandatory values:\n\n"
 #if !defined(TURN_NO_SQLITE)
 	"	-b, --db, --userdb		SQLite database file, default value is /var/db/turndb or\n"
@@ -670,6 +669,9 @@ static char AdminUsage[] = "Usage: turnadmin [command] [options]\n"
 	"	-u, --user			Username\n"
 	"	-r, --realm			Realm\n"
 	"	-p, --password			Password\n"
+	"	-x, --key-path			Generates a 128 bit key into the given path.\n"
+	"	-f, --file-key-path		Contains a 128 bit key in the given path.\n"
+	"	-v, --verify			Verify a given base64 encrypted type password.\n"
 #if !defined(TURN_NO_SQLITE) || !defined(TURN_NO_PQ) || !defined(TURN_NO_MYSQL) || !defined(TURN_NO_MONGO) || !defined(TURN_NO_HIREDIS)
 	"	-o, --origin			Origin\n"
 #endif
@@ -682,8 +684,8 @@ static char AdminUsage[] = "Usage: turnadmin [command] [options]\n"
 	"	-h, --help			Help\n";
 
 #define OPTIONS "c:d:p:L:E:X:i:m:l:r:u:b:B:e:M:J:N:O:q:Q:s:C:vVofhznaAS"
-  
-#define ADMIN_OPTIONS "PgGORIHKYlLkaADSdb:e:M:J:N:u:r:p:s:X:o:h"
+
+#define ADMIN_OPTIONS "PEgGORIHKYlLkaADSdb:e:M:J:N:u:r:p:s:X:o:h:x:v:f:"
 
 enum EXTRA_OPTS {
 	NO_UDP_OPT=256,
@@ -751,15 +753,17 @@ enum EXTRA_OPTS {
 	SERVER_NAME_OPT,
 	OAUTH_OPT,
 	PROD_OPT,
-	NO_HTTP_OPT
+	NO_HTTP_OPT,
+	SECRET_KEY_OPT,
+	ALLOW_ENCODING_OPT
 };
 
 struct myoption {
-        const char *name;     /* name of long option */
-        int has_arg;    /* whether option takes an argument */
-        int *flag;      /* if not NULL, set *flag to val when option found */
-        int val;        /* if flag is not NULL, value to set *flag to. */
-                        /* if flag is NULL, return value */
+		const char *name;     /* name of long option */
+		int has_arg;    /* whether option takes an argument */
+		int *flag;      /* if not NULL, set *flag to val when option found */
+		int val;        /* if flag is not NULL, value to set *flag to. */
+						/* if flag is NULL, return value */
 };
 
 struct uoptions {
@@ -870,11 +874,14 @@ static const struct myoption long_options[] = {
 				{ "no-tlsv1", optional_argument, NULL, NO_TLSV1_OPT },
 				{ "no-tlsv1_1", optional_argument, NULL, NO_TLSV1_1_OPT },
 				{ "no-tlsv1_2", optional_argument, NULL, NO_TLSV1_2_OPT },
+				{ "secret-key-file", required_argument, NULL, SECRET_KEY_OPT },
+				{ "allow-encoding-with-aes", required_argument, NULL, ALLOW_ENCODING_OPT},
 				{ NULL, no_argument, NULL, 0 }
 };
 
 static const struct myoption admin_long_options[] = {
 				{"generate-encrypted-password", no_argument, NULL, 'P' },
+				{"generate-encrypted-password-aes", no_argument, NULL, 'E'},
 				{ "key", no_argument, NULL, 'k' },
 				{ "add", no_argument, NULL, 'a' },
 				{ "delete", no_argument, NULL, 'd' },
@@ -906,6 +913,9 @@ static const struct myoption admin_long_options[] = {
 				{ "user", required_argument, NULL, 'u' },
 				{ "realm", required_argument, NULL, 'r' },
 				{ "password", required_argument, NULL, 'p' },
+				{ "file-key-path", required_argument, NULL, 'f' },
+				{ "verify", required_argument, NULL, 'v' },
+				{ "key-path", required_argument, NULL, 'x'},
 				{ "add-origin", no_argument, NULL, 'O' },
 				{ "del-origin", no_argument, NULL, 'R' },
 				{ "list-origins", required_argument, NULL, 'I' },
@@ -918,6 +928,139 @@ static const struct myoption admin_long_options[] = {
 				{ "help", no_argument, NULL, 'h' },
 				{ NULL, no_argument, NULL, 0 }
 };
+
+
+struct ctr_state {
+	unsigned char ivec[16];
+	unsigned int num;
+	unsigned char ecount[16];
+};
+struct ctr_state state;
+int init_ctr(struct ctr_state *state, const unsigned char iv[8]){
+	state->num = 0;
+	memset(state->ecount, 0, 16);
+	memset(state->ivec + 8, 0, 8);
+	memcpy(state->ivec, iv, 8);
+}
+unsigned char *base64encode (const void *b64_encode_this, int encode_this_many_bytes){
+	BIO *b64_bio, *mem_bio;      //Declares two OpenSSL BIOs: a base64 filter and a memory BIO.
+	BUF_MEM *mem_bio_mem_ptr;    //Pointer to a "memory BIO" structure holding our base64 data.
+	b64_bio = BIO_new(BIO_f_base64());                      //Initialize our base64 filter BIO.
+	mem_bio = BIO_new(BIO_s_mem());                           //Initialize our memory sink BIO.
+	BIO_push(b64_bio, mem_bio);            //Link the BIOs by creating a filter-sink BIO chain.
+	BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL);  //No newlines every 64 characters or less.
+	BIO_write(b64_bio, b64_encode_this, encode_this_many_bytes); //Records base64 encoded data.
+	BIO_flush(b64_bio);   //Flush data.  Necessary for b64 encoding, because of pad characters.
+	BIO_get_mem_ptr(mem_bio, &mem_bio_mem_ptr);  //Store address of mem_bio's memory structure.
+	BIO_set_close(mem_bio, BIO_NOCLOSE);   //Permit access to mem_ptr after BIOs are destroyed.
+	BIO_free_all(b64_bio);  //Destroys all BIOs in chain, starting with b64 (i.e. the 1st one).
+	BUF_MEM_grow(mem_bio_mem_ptr, (*mem_bio_mem_ptr).length + 1);   //Makes space for end null.
+	(*mem_bio_mem_ptr).data[(*mem_bio_mem_ptr).length] = '\0';  //Adds null-terminator to tail.
+	return (*mem_bio_mem_ptr).data; //Returns base-64 encoded data. (See: "buf_mem_st" struct).
+}
+void encrypt(char* in, char* mykey){
+
+
+	AES_KEY key;
+	int size=0;
+	char iv[8] = {0}; //changed
+	char out[256]; //changed
+	AES_set_encrypt_key(mykey, 128, &key);
+	char total[256]="";
+	char tempinput[20];
+	int i=0;
+	while(1){
+		init_ctr(&state, iv);
+		sprintf(tempinput,"%.16s",&in[i*16]);
+		size=strlen(tempinput);
+		if(size==0){break;}
+		AES_ctr128_encrypt(tempinput, out, strlen(tempinput), &key, state.ivec, state.ecount, &state.num);
+		strcat(total,out);
+		++i;
+		if (size <16){ break;}
+	}
+
+	int bytes_to_encode = strlen((char*)total);
+	signed char *base64_encoded = base64encode(total, bytes_to_encode);
+	printf("%s\n",base64_encoded);
+}
+void generate_aes_128_key(char* filePath, char* returnedKey){
+	int i;
+	int part;
+	FILE* fptr;
+	char key[16];
+	struct timespec times;
+	clock_gettime(CLOCK_REALTIME,&times);
+	srand(times.tv_nsec);
+
+	for (i = 0; i < sizeof(key); i++) {
+		part = (rand() % 3);
+		if(part == 0){
+			key[i] = (rand() % 10) + 48;
+		}
+
+		else if(part == 1){
+			key[i] = (rand() % 26) + 65;
+		}
+
+		else if(part == 2){
+			key[i] = (rand() % 26) + 97;
+		}
+	}
+	fptr = fopen(filePath, "w");
+	for(i = 0; i < 16; i++){
+		fputc(key[i], fptr);
+	}
+	strcpy(returnedKey, key);
+	fclose(fptr);
+
+
+}
+
+unsigned char *base64decode (const void *b64_decode_this, int decode_this_many_bytes){
+	BIO *b64_bio, *mem_bio;      //Declares two OpenSSL BIOs: a base64 filter and a memory BIO.
+	char *base64_decoded = calloc( (decode_this_many_bytes*3)/4+1, sizeof(char) ); //+1 = null.
+	b64_bio = BIO_new(BIO_f_base64());                      //Initialize our base64 filter BIO.
+	mem_bio = BIO_new(BIO_s_mem());                         //Initialize our memory source BIO.
+	BIO_write(mem_bio, b64_decode_this, decode_this_many_bytes); //Base64 data saved in source.
+	BIO_push(b64_bio, mem_bio);          //Link the BIOs by creating a filter-source BIO chain.
+	BIO_set_flags(b64_bio, BIO_FLAGS_BASE64_NO_NL);          //Don't require trailing newlines.
+	int decoded_byte_index = 0;   //Index where the next base64_decoded byte should be written.
+	while ( 0 < BIO_read(b64_bio, base64_decoded+decoded_byte_index, 1) ){ //Read byte-by-byte.
+		decoded_byte_index++; //Increment the index until read of BIO decoded data is complete.
+	} //Once we're done reading decoded data, BIO_read returns -1 even though there's no error.
+	BIO_free_all(b64_bio);  //Destroys all BIOs in chain, starting with b64 (i.e. the 1st one).
+	return base64_decoded;        //Returns base-64 decoded data with trailing null terminator.
+}
+void decrypt(char* in, char* mykey){
+
+
+	char iv[8] = {0}; //changed
+	AES_KEY key;
+	char outdata[256];	//changed
+	AES_set_encrypt_key(mykey, 128, &key);
+	int size=0;
+	int bytes_to_decode = strlen(in);
+	//printf("byte_to_decode: %d\n",bytes_to_decode);
+	 char *encryptedText = base64decode(in, bytes_to_decode); //changed
+	//printf("encryptedText: %s\n",encryptedText);
+	char temp[256];
+	char last[1024]="";
+	int i=0;
+	while(1){
+		init_ctr(&state, iv);
+		sprintf(temp,"%.16s",&encryptedText[i*16]);
+		size=strlen(temp);
+		if(size==0){break;}
+		AES_ctr128_encrypt(temp, outdata, strlen(temp), &key, state.ivec, state.ecount, &state.num);
+		strcat(last,outdata);
+		++i;
+		if (size < 16){break;}
+	}
+
+	printf("%s\n",last);
+
+}
 
 static int get_int_value(const char* s, int default_value)
 {
@@ -941,7 +1084,7 @@ static int get_bool_value(const char* s)
 static void set_option(int c, char *value)
 {
   if(value && value[0]=='=') {
-    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: option -%c is possibly used incorrectly. The short form of the option must be used as this: -%c <value>, no \'equals\' sign may be used, that sign is used only with long form options (like --user=<username>).\n",(char)c,(char)c);
+	TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "WARNING: option -%c is possibly used incorrectly. The short form of the option must be used as this: -%c <value>, no \'equals\' sign may be used, that sign is used only with long form options (like --user=<username>).\n",(char)c,(char)c);
   }
 
   switch (c) {
@@ -956,7 +1099,7 @@ static void set_option(int c, char *value)
 	  }
 	  break;
   case NO_SSLV2_OPT:
-    //deprecated
+	//deprecated
 	  break;
   case NO_SSLV3_OPT:
 	  //deprecated
@@ -1171,7 +1314,7 @@ static void set_option(int c, char *value)
 		if (get_bool_value(value)) {
 			turn_params.ct = TURN_CREDENTIALS_LONG_TERM;
 			use_lt_credentials=1;
-            use_ltc=1;
+			use_ltc=1;
 		} else {
 			turn_params.ct = TURN_CREDENTIALS_UNDEFINED;
 			use_lt_credentials=0;
@@ -1233,14 +1376,14 @@ static void set_option(int c, char *value)
 #endif
 	case AUTH_SECRET_OPT:
 		turn_params.use_auth_secret_with_timestamp = 1;
-        use_tltc = 1;
+		use_tltc = 1;
 		turn_params.ct = TURN_CREDENTIALS_LONG_TERM;
 		use_lt_credentials = 1;
 		break;
 	case STATIC_AUTH_SECRET_VAL_OPT:
 		add_to_secrets_list(&turn_params.default_users_db.ram_db.static_auth_secrets,value);
 		turn_params.use_auth_secret_with_timestamp = 1;
-        use_tltc = 1;
+		use_tltc = 1;
 		turn_params.ct = TURN_CREDENTIALS_LONG_TERM;
 		use_lt_credentials = 1;
 		break;
@@ -1305,6 +1448,12 @@ static void set_option(int c, char *value)
 	case DH_FILE_OPT:
 		STRCPY(turn_params.dh_file,value);
 		break;
+	case SECRET_KEY_OPT:
+		 STRCPY(turn_params.secret_key_file,value);
+		 break;
+  	case ALLOW_ENCODING_OPT:
+  		turn_params.allow_encoding = atoi(value);
+  		break;
 	case PKEY_FILE_OPT:
 		STRCPY(turn_params.pkey_file,value);
 		break;
@@ -1408,23 +1557,23 @@ static void read_config_file(int argc, char **argv, int pass)
 	if(pass == 0) {
 
 	  if (argv) {
-	    int i = 0;
-	    for (i = 0; i < argc; i++) {
-	      if (!strcmp(argv[i], "-c")) {
+		int i = 0;
+		for (i = 0; i < argc; i++) {
+		  if (!strcmp(argv[i], "-c")) {
 		if (i < argc - 1) {
 		  STRCPY(config_file, argv[i + 1]);
 		} else {
 		  TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "Wrong usage of -c option\n");
 		}
-	      } else if (!strcmp(argv[i], "-n")) {
+		  } else if (!strcmp(argv[i], "-n")) {
 		turn_params.do_not_use_config_file = 1;
 		config_file[0]=0;
 		return;
-	      } else if (!strcmp(argv[i], "-h")) {
+		  } else if (!strcmp(argv[i], "-h")) {
 		printf("\n%s\n",Usage);
 		exit(0);
-	      }
-	    }
+		  }
+		}
 	  }
 	}
 
@@ -1492,6 +1641,10 @@ static int adminmain(int argc, char **argv)
 	TURNADMIN_COMMAND_TYPE ct = TA_COMMAND_UNKNOWN;
 
 	int is_admin = 0;
+	FILE* fptr;
+	char generated_key[20]; //changed
+	int counter;
+	char ch;
 
 	u08bits user[STUN_MAX_USERNAME_SIZE+1]="\0";
 	u08bits realm[STUN_MAX_REALM_SIZE+1]="\0";
@@ -1504,153 +1657,182 @@ static int adminmain(int argc, char **argv)
 	uo.u.m = admin_long_options;
 
 	int print_enc_password = 0;
+	int print_enc_aes_password = 0;
 
 	while (((c = getopt_long(argc, argv, ADMIN_OPTIONS, uo.u.o, NULL)) != -1)) {
 		switch (c){
-		case 'P':
-			if(pwd[0]) {
-				char result[257];
-				generate_new_enc_password((char*)pwd, result);
-				printf("%s\n",result);
-				exit(0);
-			}
-			print_enc_password = 1;
-			break;
-		case 'g':
-			ct = TA_SET_REALM_OPTION;
-			break;
-		case 'G':
-			ct = TA_LIST_REALM_OPTIONS;
-			break;
-		case ADMIN_USER_QUOTA_OPT:
-			po.user_quota = (vint)atoi(optarg);
-			break;
-		case ADMIN_TOTAL_QUOTA_OPT:
-			po.total_quota = (vint)atoi(optarg);
-			break;
-		case ADMIN_MAX_BPS_OPT:
-			po.max_bps = (vint)atoi(optarg);
-			break;
-		case 'O':
-			ct = TA_ADD_ORIGIN;
-			break;
-		case 'R':
-			ct = TA_DEL_ORIGIN;
-			break;
-		case 'I':
-			ct = TA_LIST_ORIGINS;
-			break;
-		case 'o':
-			STRCPY(origin,optarg);
-			break;
-		case 'k':
-			ct = TA_PRINT_KEY;
-			break;
-		case 'a':
-			ct = TA_UPDATE_USER;
-			break;
-		case 'd':
-			ct = TA_DELETE_USER;
-			break;
-		case 'A':
-			ct = TA_UPDATE_USER;
-			is_admin = 1;
-			break;
-		case 'D':
-			ct = TA_DELETE_USER;
-			is_admin = 1;
-			break;
-		case 'l':
-			ct = TA_LIST_USERS;
-			break;
-		case 'L':
-			ct = TA_LIST_USERS;
-			is_admin = 1;
-			break;
-		case 's':
-			ct = TA_SET_SECRET;
-			STRCPY(secret,optarg);
-			break;
-		case 'S':
-			ct = TA_SHOW_SECRET;
-			break;
-		case 'X':
-			ct = TA_DEL_SECRET;
-			if(optarg)
+			case 'P':
+				if(pwd[0]) {
+					char result[257];
+					generate_new_enc_password((char*)pwd, result);
+					printf("%s\n",result);
+					exit(0);
+				}
+				print_enc_password = 1;
+				break;
+			case 'E':
+				print_enc_aes_password = 1;
+				break;
+			case 'g':
+				ct = TA_SET_REALM_OPTION;
+				break;
+			case 'G':
+				ct = TA_LIST_REALM_OPTIONS;
+				break;
+			case ADMIN_USER_QUOTA_OPT:
+				po.user_quota = (vint)atoi(optarg);
+				break;
+			case ADMIN_TOTAL_QUOTA_OPT:
+				po.total_quota = (vint)atoi(optarg);
+				break;
+			case ADMIN_MAX_BPS_OPT:
+				po.max_bps = (vint)atoi(optarg);
+				break;
+			case 'O':
+				ct = TA_ADD_ORIGIN;
+				break;
+			case 'R':
+				ct = TA_DEL_ORIGIN;
+				break;
+			case 'I':
+				ct = TA_LIST_ORIGINS;
+				break;
+			case 'o':
+				STRCPY(origin,optarg);
+				break;
+			case 'k':
+				ct = TA_PRINT_KEY;
+				break;
+			case 'a':
+				ct = TA_UPDATE_USER;
+				break;
+			case 'd':
+				ct = TA_DELETE_USER;
+				break;
+			case 'A':
+				ct = TA_UPDATE_USER;
+				is_admin = 1;
+				break;
+			case 'D':
+				ct = TA_DELETE_USER;
+				is_admin = 1;
+				break;
+			case 'l':
+				ct = TA_LIST_USERS;
+				break;
+			case 'L':
+				ct = TA_LIST_USERS;
+				is_admin = 1;
+				break;
+			case 's':
+				ct = TA_SET_SECRET;
 				STRCPY(secret,optarg);
-			break;
-		case DEL_ALL_AUTH_SECRETS_OPT:
-			ct = TA_DEL_SECRET;
-			break;
-#if !defined(TURN_NO_SQLITE)
-		case 'b':
-		  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
-		  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_SQLITE;
-		  break;
-#endif
-#if !defined(TURN_NO_PQ)
-		case 'e':
-		  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
-		  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_PQ;
-		  break;
-#endif
-#if !defined(TURN_NO_MYSQL)
-		case 'M':
-		  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
-		  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_MYSQL;
-		  break;
-#endif
-#if !defined(TURN_NO_MONGO)
-		case 'J':
-		  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
-		  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_MONGO;
-		  break;
-#endif
-#if !defined(TURN_NO_HIREDIS)
-		case 'N':
-		  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
-		  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_REDIS;
-		  break;
-#endif
-		case 'u':
-			STRCPY(user,optarg);
-			if(!is_secure_username((u08bits*)user)) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong user name structure or symbols, choose another name: %s\n",user);
-				exit(-1);
-			}
-			if(SASLprep((u08bits*)user)<0) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong user name: %s\n",user);
-				exit(-1);
-			}
-			break;
-		case 'r':
-			set_default_realm_name(optarg);
-			STRCPY(realm,optarg);
-			if(SASLprep((u08bits*)realm)<0) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong realm: %s\n",realm);
-				exit(-1);
-			}
-			break;
-		case 'p':
-			STRCPY(pwd,optarg);
-			if(SASLprep((u08bits*)pwd)<0) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: %s\n",pwd);
-				exit(-1);
-			}
-			if(print_enc_password) {
-				char result[257];
-				generate_new_enc_password((char*)pwd, result);
-				printf("%s\n",result);
+				break;
+			case 'S':
+				ct = TA_SHOW_SECRET;
+				break;
+			case 'X':
+				ct = TA_DEL_SECRET;
+				if(optarg)
+					STRCPY(secret,optarg);
+				break;
+			case DEL_ALL_AUTH_SECRETS_OPT:
+				ct = TA_DEL_SECRET;
+				break;
+	#if !defined(TURN_NO_SQLITE)
+			case 'b':
+			  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
+			  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_SQLITE;
+			  break;
+	#endif
+	#if !defined(TURN_NO_PQ)
+			case 'e':
+			  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
+			  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_PQ;
+			  break;
+	#endif
+	#if !defined(TURN_NO_MYSQL)
+			case 'M':
+			  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
+			  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_MYSQL;
+			  break;
+	#endif
+	#if !defined(TURN_NO_MONGO)
+			case 'J':
+			  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
+			  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_MONGO;
+			  break;
+	#endif
+	#if !defined(TURN_NO_HIREDIS)
+			case 'N':
+			  STRCPY(turn_params.default_users_db.persistent_users_db.userdb,optarg);
+			  turn_params.default_users_db.userdb_type = TURN_USERDB_TYPE_REDIS;
+			  break;
+	#endif
+			case 'u':
+				STRCPY(user,optarg);
+				if(!is_secure_username((u08bits*)user)) {
+					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong user name structure or symbols, choose another name: %s\n",user);
+					exit(-1);
+				}
+				if(SASLprep((u08bits*)user)<0) {
+					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong user name: %s\n",user);
+					exit(-1);
+				}
+				break;
+			case 'r':
+				set_default_realm_name(optarg);
+				STRCPY(realm,optarg);
+				if(SASLprep((u08bits*)realm)<0) {
+					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong realm: %s\n",realm);
+					exit(-1);
+				}
+				break;
+			case 'p':
+				STRCPY(pwd,optarg);
+				if(SASLprep((u08bits*)pwd)<0) {
+					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Wrong password: %s\n",pwd);
+					exit(-1);
+				}
+				if(print_enc_password) {
+					char result[257];
+					generate_new_enc_password((char*)pwd, result);
+					printf("%s\n",result);
+					exit(0);
+				}
+
+				if(print_enc_aes_password){
+					encrypt((unsigned char*)pwd, generated_key);
+					exit(0);
+				}
+				break;
+
+			case 'x':
+				generate_aes_128_key(optarg, generated_key);
 				exit(0);
-			}
-			break;
-		case 'h':
-			printf("\n%s\n", AdminUsage);
-			exit(0);
-			break;
-		default:
-			fprintf(stderr,"\n%s\n", AdminUsage);
-			exit(-1);
+				break;
+			case 'f':
+				fptr = fopen((char*)optarg, "r");
+				if(fptr == NULL){
+					printf("No such file like %s\n", (char*)optarg);
+				}
+				else{
+					for(counter = 0; (ch = fgetc(fptr)) != EOF; counter++){
+						generated_key[counter] = ch;
+					}
+					fclose(fptr);
+				}
+				break;
+			case 'v':
+				decrypt((char*)optarg, generated_key);
+				exit(0);
+			case 'h':
+				printf("\n%s\n", AdminUsage);
+				exit(0);
+				break;
+			default:
+				fprintf(stderr,"\n%s\n", AdminUsage);
+				exit(-1);
 		}
 	}
 
@@ -1958,7 +2140,7 @@ int main(int argc, char **argv)
 
 	while (((c = getopt_long(argc, argv, OPTIONS, uo.u.o, NULL)) != -1)) {
 	  if(c == 'u') {
-	    set_option(c,optarg);
+		set_option(c,optarg);
 	  }
 	}
 
@@ -2001,11 +2183,11 @@ int main(int argc, char **argv)
 		exit(-1);
 	}
 
-    if(use_ltc && use_tltc) {
+	if(use_ltc && use_tltc) {
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING, "\nCONFIGURATION ALERT: You specified --lt-cred-mech and --use-auth-secret in the same time.\n"
-                       "Be aware that you could not mix the username/password and the shared secret based auth methohds. \n"
-                       "Shared secret overrides username/password based auth method. Check your configuration!\n");
-    }
+					   "Be aware that you could not mix the username/password and the shared secret based auth methohds. \n"
+					   "Shared secret overrides username/password based auth method. Check your configuration!\n");
+	}
 
 	if(!use_lt_credentials && !anon_credentials) {
 		if(turn_params.default_users_db.ram_db.users_number) {
@@ -2158,9 +2340,6 @@ int main(int argc, char **argv)
 
 	setup_server();
 
-	struct event *ev = evsignal_new(turn_params.listener.event_base, SIGUSR2, reload_ssl_certs, NULL);
-	event_add(ev, NULL);
-
 	drop_privileges();
 
 	run_listener_server(&(turn_params.listener));
@@ -2195,13 +2374,13 @@ void coturn_id_function(CRYPTO_THREADID *ctid);
 void coturn_id_function(CRYPTO_THREADID *ctid)
 {
 	UNUSED_ARG(ctid);
-    CRYPTO_THREADID_set_numeric(ctid, (unsigned long)pthread_self());
+	CRYPTO_THREADID_set_numeric(ctid, (unsigned long)pthread_self());
 }
 #else
 unsigned long coturn_id_function(void);
 unsigned long coturn_id_function(void)
 {
-    return (unsigned long)pthread_self();
+	return (unsigned long)pthread_self();
 }
 #endif
 
@@ -2241,7 +2420,7 @@ int THREAD_cleanup(void) {
   int i;
 
   if (!mutex_buf_initialized)
-    return 0;
+	return 0;
 
 #if OPENSSL_VERSION_NUMBER >= 0x10000000L
 	CRYPTO_THREADID_set_callback(NULL);
@@ -2282,15 +2461,15 @@ static void adjust_key_file_name(char *fn, const char* file_title, int critical)
 	  }
 
 	  if(!full_path_to_file) {
-	    TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,"WARNING: cannot find %s file: %s (2)\n",file_title,fn);
-	    goto keyerr;
+		TURN_LOG_FUNC(TURN_LOG_LEVEL_WARNING,"WARNING: cannot find %s file: %s (2)\n",file_title,fn);
+		goto keyerr;
 	  }
 
 	  strncpy(fn,full_path_to_file,sizeof(turn_params.cert_file)-1);
 	  fn[sizeof(turn_params.cert_file)-1]=0;
 
 	  if(full_path_to_file)
-	    turn_free(full_path_to_file,strlen(full_path_to_file)+1);
+		turn_free(full_path_to_file,strlen(full_path_to_file)+1);
 	  return;
 	}
 
@@ -2498,10 +2677,8 @@ static int ServerALPNCallback(SSL *ssl,
 
 #endif
 
-static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* method)
+static void set_ctx(SSL_CTX* ctx, const char *protocol)
 {
-	SSL_CTX* ctx = SSL_CTX_new(method);
-	int err = 0;
 #if ALPN_SUPPORTED
 	SSL_CTX_set_alpn_select_cb(ctx, ServerALPNCallback, NULL);
 #endif
@@ -2518,7 +2695,6 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 
 	if (!SSL_CTX_use_certificate_chain_file(ctx, turn_params.cert_file)) {
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: no certificate found\n", protocol);
-		err = 1;
 	} else {
 		print_abs_file_name(protocol, ": Certificate", turn_params.cert_file);
 	}
@@ -2526,7 +2702,6 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 	if (!SSL_CTX_use_PrivateKey_file(ctx, turn_params.pkey_file, SSL_FILETYPE_PEM)) {
 		if (!SSL_CTX_use_RSAPrivateKey_file(ctx, turn_params.pkey_file, SSL_FILETYPE_PEM)) {
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: no valid private key found, or invalid private key password provided\n", protocol);
-			err = 1;
 		} else {
 			print_abs_file_name(protocol, ": Private RSA key", turn_params.pkey_file);
 		}
@@ -2536,14 +2711,12 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 
 	if (!SSL_CTX_check_private_key(ctx)) {
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: invalid private key\n", protocol);
-		err = 1;
 	}
 
 	if(turn_params.ca_cert_file[0]) {
 
 		if (!SSL_CTX_load_verify_locations(ctx, turn_params.ca_cert_file, NULL )) {
 			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "Cannot load CA from file: %s\n", turn_params.ca_cert_file);
-			err = 1;
 		}
 
 		SSL_CTX_set_client_CA_list(ctx,SSL_load_client_CA_file(turn_params.ca_cert_file));
@@ -2587,7 +2760,7 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 				EC_KEY *ecdh = EC_KEY_new_by_curve_name(nid);
 				if (!ecdh) {
 					TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR,
-				      "%s: ERROR: allocate EC suite\n",__FUNCTION__);
+					  "%s: ERROR: allocate EC suite\n",__FUNCTION__);
 					set_auto_curve = 1;
 				} else {
 					SSL_CTX_set_tmp_ecdh(ctx, ecdh);
@@ -2641,14 +2814,29 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 		*/
 
 		if(!dh) {
-			TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot allocate DH suite\n",__FUNCTION__);
-			err = 1;
+		  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot allocate DH suite\n",__FUNCTION__);
 		} else {
 			if (1 != SSL_CTX_set_tmp_dh (ctx, dh)) {
-				TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot set DH\n",__FUNCTION__);
-				err = 1;
+			  TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot set DH\n",__FUNCTION__);
 			}
 			DH_free (dh);
+		}
+	}
+
+	{//secret key
+
+		if(turn_params.secret_key_file[0]) {
+			FILE *f = fopen(turn_params.secret_key_file, "r");
+
+			if (!f) {
+				perror("Cannot open Secret-Key file");
+			} else {
+				fseek (f, 0, SEEK_SET);
+				fread (turn_params.secret_key, sizeof(char), 16, f);
+				fclose (f);
+
+			}
+
 		}
 	}
 
@@ -2700,17 +2888,8 @@ static void set_ctx(SSL_CTX** out, const char *protocol, const SSL_METHOD* metho
 
 		SSL_CTX_set_options(ctx, op);
 	}
-
-	if (*out == NULL) {
-		// Always initialize, even if issues were encountered
-		*out = ctx;
-	} else if (!err) {
-		SSL_CTX_free(*out);
-		*out = ctx;
-	}
 }
 
-static void openssl_load_certificates(void);
 static void openssl_setup(void)
 {
 	THREAD_setup();
@@ -2740,24 +2919,22 @@ static void openssl_setup(void)
 		adjust_key_file_names();
 	}
 
-	openssl_load_certificates();
-}
-
-static void openssl_load_certificates(void)
-{
-	pthread_mutex_lock(&turn_params.tls_mutex);
 	if(!turn_params.no_tls) {
-		set_ctx(&turn_params.tls_ctx_ssl23,"SSL23",SSLv23_server_method()); /*compatibility mode */
+		turn_params.tls_ctx_ssl23 = SSL_CTX_new(SSLv23_server_method()); /*compatibility mode */
+		set_ctx(turn_params.tls_ctx_ssl23,"SSL23");
 		if(!turn_params.no_tlsv1) {
-			set_ctx(&turn_params.tls_ctx_v1_0,"TLS1.0",TLSv1_server_method());
+			turn_params.tls_ctx_v1_0 = SSL_CTX_new(TLSv1_server_method());
+			set_ctx(turn_params.tls_ctx_v1_0,"TLS1.0");
 		}
 #if TLSv1_1_SUPPORTED
 		if(!turn_params.no_tlsv1_1) {
-			set_ctx(&turn_params.tls_ctx_v1_1,"TLS1.1",TLSv1_1_server_method());
+			turn_params.tls_ctx_v1_1 = SSL_CTX_new(TLSv1_1_server_method());
+			set_ctx(turn_params.tls_ctx_v1_1,"TLS1.1");
 		}
 #if TLSv1_2_SUPPORTED
 		if(!turn_params.no_tlsv1_2) {
-			set_ctx(&turn_params.tls_ctx_v1_2,"TLS1.2",TLSv1_2_server_method());
+			turn_params.tls_ctx_v1_2 = SSL_CTX_new(TLSv1_2_server_method());
+			set_ctx(turn_params.tls_ctx_v1_2,"TLS1.2");
 		}
 #endif
 #endif
@@ -2773,31 +2950,20 @@ static void openssl_load_certificates(void)
 		}
 
 #if DTLSv1_2_SUPPORTED
-		set_ctx(&turn_params.dtls_ctx,"DTLS",DTLS_server_method());
-		set_ctx(&turn_params.dtls_ctx_v1_2,"DTLS1.2",DTLSv1_2_server_method());
+		turn_params.dtls_ctx = SSL_CTX_new(DTLS_server_method());
+		turn_params.dtls_ctx_v1_2 = SSL_CTX_new(DTLSv1_2_server_method());
+		set_ctx(turn_params.dtls_ctx_v1_2,"DTLS1.2");
 		SSL_CTX_set_read_ahead(turn_params.dtls_ctx_v1_2, 1);
 #else
-		set_ctx(&turn_params.dtls_ctx,"DTLS",DTLSv1_server_method());
+		turn_params.dtls_ctx = SSL_CTX_new(DTLSv1_server_method());
 #endif
+		set_ctx(turn_params.dtls_ctx,"DTLS");
 		SSL_CTX_set_read_ahead(turn_params.dtls_ctx, 1);
 
 		TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS cipher suite: %s\n",turn_params.cipher_list);
 
 #endif
 	}
-	pthread_mutex_unlock(&turn_params.tls_mutex);
-}
-
-static void reload_ssl_certs(evutil_socket_t sock, short events, void *args)
-{
-	TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "Reloading TLS certificates and keys");
-	openssl_load_certificates();
-	if (turn_params.tls_ctx_update_ev != NULL)
-		event_active(turn_params.tls_ctx_update_ev, EV_READ, 0);
-
-	UNUSED_ARG(sock);
-	UNUSED_ARG(events);
-	UNUSED_ARG(args);
 }
 
 ///////////////////////////////

@@ -173,6 +173,7 @@ int main(int argc, char **argv)
 	char rest_api_separator = ':';
 	int use_null_cipher=0;
 
+	
 	set_logfile("stdout");
 
 	set_execdir();
@@ -328,15 +329,13 @@ int main(int argc, char **argv)
 			passive_tcp = 1;
 			/* implies 'T': */
 			/* no break */
-			/* Falls through. */
 		case 'T':
 			relay_transport = STUN_ATTRIBUTE_TRANSPORT_TCP_VALUE;
 			break;
 		case 'U':
-			use_null_cipher = 1;
-			/* implies 'S' */
-			/* no break */
-			/* Falls through. */
+		  use_null_cipher = 1;
+		  /* implies 'S' */
+		  /* no break */
 		case 'S':
 			use_secure = 1;
 			break;
